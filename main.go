@@ -331,7 +331,13 @@ func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+		},
+	})
 	if err != nil {
 		log.Errorw("Failed to create peer connection", err)
 		http.Error(w, "Failed to create peer connection", http.StatusInternalServerError)
@@ -387,6 +393,15 @@ func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
 		app.cleanupPeerConnection(connID)
 		return
 	}
+
+	// Log local ICE candidates as they are gathered (useful for debugging)
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c != nil {
+			log.Infow("Local ICE candidate gathered", "candidate", c.ToJSON().Candidate, "chatbotId", chatbotId)
+		} else {
+			log.Infow("ICE gathering complete (server)", "chatbotId", chatbotId)
+		}
+	})
 
 	// Setup ICE connection state change handler
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
