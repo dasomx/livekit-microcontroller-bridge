@@ -12,7 +12,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/livekit/protocol/auth"
+	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	lksdk "github.com/livekit/server-sdk-go/v2"
 	"github.com/pion/webrtc/v4"
@@ -35,14 +37,21 @@ type App struct {
 	peerConnMu   sync.RWMutex
 	livekitReady bool
 	livekitMu    sync.RWMutex
+	
+	// Room management
+	roomClient     *lksdk.RoomServiceClient
+	dispatchClient *lksdk.AgentDispatchClient
+	roomConnections map[string]int  // roomName -> connection count
+	roomConnMu     sync.RWMutex
+	currentRoom    string          // currently connected room
 }
 
 func init() {
-	flag.StringVar(&host, "host", "", "livekit server host")
-	flag.StringVar(&apiKey, "api-key", "", "livekit api key")
-	flag.StringVar(&apiSecret, "api-secret", "", "livekit api secret")
+	flag.StringVar(&host, "host", os.Getenv("LIVEKIT_HOST"), "livekit server host")
+	flag.StringVar(&apiKey, "api-key", os.Getenv("LIVEKIT_API_KEY"), "livekit api key")
+	flag.StringVar(&apiSecret, "api-secret", os.Getenv("LIVEKIT_API_SECRET"), "livekit api secret")
 	flag.StringVar(&roomName, "room-name", "embedded", "room name")
-	flag.StringVar(&identity, "identity", "", "participant identity")
+	flag.StringVar(&identity, "identity", os.Getenv("IDENTITY"), "participant identity")
 }
 
 func main() {
@@ -50,6 +59,7 @@ func main() {
 	log = logger.GetLogger()
 	lksdk.SetLogger(log)
 	
+	godotenv.Load(".env")
 	flag.Parse()
 	if err := validateFlags(); err != nil {
 		log.Errorw("invalid arguments", err)
@@ -57,8 +67,9 @@ func main() {
 	}
 
 	app := &App{
-		peerConns:    make(map[string]*webrtc.PeerConnection),
-		livekitReady: false,
+		peerConns:       make(map[string]*webrtc.PeerConnection),
+		livekitReady:    false,
+		roomConnections: make(map[string]int),
 	}
 	app.ctx, app.cancel = context.WithCancel(context.Background())
 
@@ -75,7 +86,7 @@ func main() {
 		}
 	}()
 
-	log.Infow("Application started successfully", "port", "8080", "note", "LiveKit will connect when first microcontroller connects")
+	log.Infow("Application started successfully", "port", "8081", "note", "LiveKit will connect when first microcontroller connects")
 
 	// Wait for shutdown signal
 	<-sigChan
@@ -85,34 +96,79 @@ func main() {
 }
 
 func validateFlags() error {
-	if host == "" {
-		return fmt.Errorf("host is required")
+	// Read directly from environment variables, with fallbacks to flag values
+	envHost := os.Getenv("LIVEKIT_HOST")
+	if envHost == "" {
+		envHost = host
 	}
-	if apiKey == "" {
-		return fmt.Errorf("api-key is required")
+	if envHost == "" {
+		return fmt.Errorf("LIVEKIT_HOST environment variable or -host flag is required")
 	}
-	if apiSecret == "" {
-		return fmt.Errorf("api-secret is required")
+
+	envApiKey := os.Getenv("LIVEKIT_API_KEY")
+	if envApiKey == "" {
+		envApiKey = apiKey
 	}
-	if roomName == "" {
-		return fmt.Errorf("room-name is required")
+	if envApiKey == "" {
+		return fmt.Errorf("LIVEKIT_API_KEY environment variable or -api-key flag is required")
 	}
-	if identity == "" {
-		return fmt.Errorf("identity is required")
+
+	envApiSecret := os.Getenv("LIVEKIT_API_SECRET")
+	if envApiSecret == "" {
+		envApiSecret = apiSecret
 	}
+	if envApiSecret == "" {
+		return fmt.Errorf("LIVEKIT_API_SECRET environment variable or -api-secret flag is required")
+	}
+
+	envIdentity := os.Getenv("IDENTITY")
+	if envIdentity == "" {
+		envIdentity = identity
+	}
+	if envIdentity == "" {
+		return fmt.Errorf("IDENTITY environment variable or -identity flag is required")
+	}
+
+	// Update the global variables with the final values
+	host = envHost
+	apiKey = envApiKey
+	apiSecret = envApiSecret
+	identity = envIdentity
+
 	return nil
 }
 
-func (app *App) initializeLiveKit() error {
+func (app *App) initializeLiveKitForRoom(roomName string) error {
 	app.livekitMu.Lock()
 	defer app.livekitMu.Unlock()
 	
-	// Check if already initialized
-	if app.livekitReady {
+	// Initialize clients if not already done
+	if app.roomClient == nil {
+		app.roomClient = lksdk.NewRoomServiceClient(host, apiKey, apiSecret)
+		app.dispatchClient = lksdk.NewAgentDispatchServiceClient(host, apiKey, apiSecret)
+		log.Infow("Room service and agent dispatch clients initialized")
+	}
+	
+	// Check if already initialized for this room
+	if app.livekitReady && app.currentRoom == roomName {
+		// Increment connection count for this room
+		app.roomConnMu.Lock()
+		app.roomConnections[roomName]++
+		app.roomConnMu.Unlock()
+		log.Infow("Reusing existing LiveKit connection", "roomName", roomName, "connections", app.roomConnections[roomName])
 		return nil
 	}
 	
-	log.Infow("Initializing LiveKit connection...")
+	// If we're connected to a different room, disconnect first
+	if app.livekitReady && app.currentRoom != roomName {
+		log.Infow("Switching rooms, disconnecting from current room", "currentRoom", app.currentRoom, "newRoom", roomName)
+		if app.room != nil {
+			app.room.Disconnect()
+		}
+		app.livekitReady = false
+	}
+	
+	log.Infow("Initializing LiveKit connection...", "roomName", roomName)
 	
 	var err error
 	
@@ -125,7 +181,7 @@ func (app *App) initializeLiveKit() error {
 		return fmt.Errorf("failed to create LiveKit track: %w", err)
 	}
 
-	// Generate access token
+	// Generate access token with dynamic room name
 	token, err := newAccessToken(apiKey, apiSecret, roomName, identity)
 	if err != nil {
 		return fmt.Errorf("failed to create access token: %w", err)
@@ -161,7 +217,18 @@ func (app *App) initializeLiveKit() error {
 	}
 
 	app.livekitReady = true
-	log.Infow("LiveKit connection established successfully")
+	app.currentRoom = roomName
+	
+	// Initialize connection count for this room
+	app.roomConnMu.Lock()
+	app.roomConnections[roomName] = 1
+	app.roomConnMu.Unlock()
+	
+	log.Infow("LiveKit connection established successfully", "roomName", roomName, "connections", 1)
+	
+	// Dispatch the okchat-voice-agent to the room
+	go app.dispatchAgent(roomName)
+	
 	return nil
 }
 
@@ -203,11 +270,11 @@ func (app *App) startServer() error {
 	mux.HandleFunc("/connect", app.connectHandler)
 	
 	app.server = &http.Server{
-		Addr:    ":8080",
+		Addr:    ":8081",
 		Handler: mux,
 	}
 	
-	log.Infow("Server listening on :8080")
+	log.Infow("Server listening on :8081")
 	return app.server.ListenAndServe()
 }
 
@@ -228,9 +295,21 @@ func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get chatbotId from query parameters
+	chatbotId := r.URL.Query().Get("chatbotId")
+	if chatbotId == "" {
+		log.Errorw("Missing chatbotId query parameter", fmt.Errorf("chatbotId parameter is required"))
+		http.Error(w, "Missing required query parameter: chatbotId", http.StatusBadRequest)
+		return
+	}
+
+	// Create room name in format "esp-{chatbotId}"
+	dynamicRoomName := fmt.Sprintf("esp-%s", chatbotId)
+	log.Infow("Processing connection request", "chatbotId", chatbotId, "roomName", dynamicRoomName)
+
 	// Initialize LiveKit connection if not already done
-	if err := app.initializeLiveKit(); err != nil {
-		log.Errorw("Failed to initialize LiveKit", err)
+	if err := app.initializeLiveKitForRoom(dynamicRoomName); err != nil {
+		log.Errorw("Failed to initialize LiveKit", err, "roomName", dynamicRoomName)
 		http.Error(w, "Failed to initialize LiveKit connection", http.StatusInternalServerError)
 		return
 	}
@@ -258,31 +337,31 @@ func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
 	// Setup track handler
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		if track.Kind() == webrtc.RTPCodecTypeAudio {
-			log.Infow("Audio track received from peer connection")
+			log.Infow("Audio track received from peer connection", "chatbotId", chatbotId)
 			
 			app.wg.Add(1)
 			go func() {
 				defer app.wg.Done()
-				defer log.Infow("Peer connection track reading goroutine terminated")
+				defer log.Infow("Peer connection track reading goroutine terminated", "chatbotId", chatbotId)
 				
 				for {
 					select {
 					case <-app.ctx.Done():
-						log.Infow("Context cancelled, stopping peer track reading")
+						log.Infow("Context cancelled, stopping peer track reading", "chatbotId", chatbotId)
 						return
 					default:
 						rtpPacket, _, rtpErr := track.ReadRTP()
 						if rtpErr != nil {
 							if rtpErr == io.EOF {
-								log.Infow("Peer track ended")
+								log.Infow("Peer track ended", "chatbotId", chatbotId)
 							} else {
-								log.Errorw("Failed to read RTP packet from peer", rtpErr)
+								log.Errorw("Failed to read RTP packet from peer", rtpErr, "chatbotId", chatbotId)
 							}
 							return
 						}
 
 						if rtpErr = embeddedTrack.WriteRTP(rtpPacket, nil); rtpErr != nil {
-							log.Errorw("Failed to write RTP packet to embedded track", rtpErr)
+							log.Errorw("Failed to write RTP packet to embedded track", rtpErr, "chatbotId", chatbotId)
 							return
 						}
 					}
@@ -301,7 +380,7 @@ func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Setup ICE connection state change handler
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Infow("ICE connection state changed", "state", state)
+		log.Infow("ICE connection state changed", "state", state, "chatbotId", chatbotId)
 		if state == webrtc.ICEConnectionStateFailed || 
 		   state == webrtc.ICEConnectionStateDisconnected ||
 		   state == webrtc.ICEConnectionStateClosed {
@@ -360,7 +439,7 @@ func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
 		log.Errorw("Failed to write response", err)
 	}
 	
-	log.Infow("Successfully handled connect request")
+	log.Infow("Successfully handled connect request", "chatbotId", chatbotId, "roomName", dynamicRoomName)
 }
 
 func (app *App) cleanupPeerConnection(connID string) {
@@ -373,6 +452,65 @@ func (app *App) cleanupPeerConnection(connID string) {
 		}
 		delete(app.peerConns, connID)
 		log.Infow("Peer connection cleaned up", "connID", connID)
+		
+		// Handle room cleanup when connection is closed
+		go app.handleRoomCleanup()
+	}
+}
+
+func (app *App) handleRoomCleanup() {
+	app.roomConnMu.Lock()
+	defer app.roomConnMu.Unlock()
+	
+	if app.currentRoom == "" {
+		return
+	}
+	
+	// Decrement connection count
+	if count, exists := app.roomConnections[app.currentRoom]; exists && count > 0 {
+		app.roomConnections[app.currentRoom]--
+		newCount := app.roomConnections[app.currentRoom]
+		
+		log.Infow("Connection count updated", "roomName", app.currentRoom, "connections", newCount)
+		
+		// If no more connections, delete the room
+		if newCount == 0 {
+			go app.deleteRoom(app.currentRoom)
+			delete(app.roomConnections, app.currentRoom)
+		}
+	}
+}
+
+func (app *App) deleteRoom(roomName string) {
+	if app.roomClient == nil {
+		log.Errorw("Room client not initialized", fmt.Errorf("cannot delete room without room client"))
+		return
+	}
+	
+	log.Infow("Deleting empty room", "roomName", roomName)
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	_, err := app.roomClient.DeleteRoom(ctx, &livekit.DeleteRoomRequest{
+		Room: roomName,
+	})
+	
+	if err != nil {
+		log.Errorw("Failed to delete room", err, "roomName", roomName)
+	} else {
+		log.Infow("Room deleted successfully", "roomName", roomName)
+		
+		// Disconnect from LiveKit if this was our current room
+		app.livekitMu.Lock()
+		if app.currentRoom == roomName {
+			if app.room != nil {
+				app.room.Disconnect()
+			}
+			app.livekitReady = false
+			app.currentRoom = ""
+		}
+		app.livekitMu.Unlock()
 	}
 }
 
@@ -439,3 +577,32 @@ func newAccessToken(apiKey, apiSecret, roomName, pID string) (string, error) {
 
 	return at.ToJWT()
 }
+
+func (app *App) dispatchAgent(roomName string) {
+	log.Infow("Dispatching okchat-voice-agent to room", "roomName", roomName)
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	// Extract chatbot ID from room name (remove "esp-" prefix)
+	chatbotId := roomName[4:]
+	
+	// Create agent dispatch request
+	req := &livekit.CreateAgentDispatchRequest{
+		Room:      roomName,
+		AgentName: "okchat-voice-agent",
+		Metadata:  fmt.Sprintf("{\"room_name\": \"%s\", \"chatbot_id\": \"%s\"}", roomName, chatbotId),
+	}
+	
+	log.Infow("Agent dispatch request created", "roomName", roomName, "agentName", "okchat-voice-agent", "chatbotId", chatbotId)
+	
+	// Dispatch agent using the client
+	dispatch, err := app.dispatchClient.CreateDispatch(ctx, req)
+	if err != nil {
+		log.Errorw("Failed to dispatch agent", err, "roomName", roomName, "agentName", "okchat-voice-agent")
+	} else {
+		log.Infow("Agent dispatched successfully", "roomName", roomName, "agentName", "okchat-voice-agent", "dispatch", dispatch)
+	}
+}
+
+
