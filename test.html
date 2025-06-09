@@ -116,9 +116,21 @@
         <input
           type="text"
           id="bridgeUrl"
-          value="http://localhost:8080/connect"
-          placeholder="http://localhost:8080/connect"
+          value="http://localhost:8081/connect"
+          placeholder="http://localhost:8081/connect"
         />
+
+        <label for="chatbotId">Chatbot ID:</label>
+        <input
+          type="text"
+          id="chatbotId"
+          value="5afe16ed-5fd2-4552-a993-903bc9c32bb6"
+          placeholder="Enter chatbot ID (e.g., test-bot-123)"
+        />
+        <p style="font-size: 12px; color: #666; margin: 5px 0">
+          This will create a room named "esp-{chatbotId}" (e.g.,
+          "esp-test-bot-123")
+        </p>
       </div>
 
       <div class="section">
@@ -252,7 +264,19 @@
 
           // Send offer to bridge
           const bridgeUrl = document.getElementById("bridgeUrl").value;
-          const response = await fetch(bridgeUrl, {
+          const chatbotId = document.getElementById("chatbotId").value;
+
+          if (!chatbotId.trim()) {
+            throw new Error("Chatbot ID is required");
+          }
+
+          const fullUrl = `${bridgeUrl}?chatbotId=${encodeURIComponent(
+            chatbotId
+          )}`;
+          log(`Connecting to room: esp-${chatbotId}`);
+          log(`Full URL: ${fullUrl}`);
+
+          const response = await fetch(fullUrl, {
             method: "POST",
             headers: {
               "Content-Type": "application/sdp",
@@ -276,12 +300,13 @@
           log("Set remote description - connection process complete");
           updateStatus("Connecting to LiveKit...", "info");
         } catch (error) {
-          log(`Connection error: ${error.message}`);
-          updateStatus(`Connection failed: ${error.message}`, "error");
-          if (peerConnection) {
-            peerConnection.close();
-            peerConnection = null;
-          }
+          console.log(error);
+          //   log(`Connection error: ${error.message}`);
+          //   updateStatus(`Connection failed: ${error.message}`, "error");
+          //   if (peerConnection) {
+          //     peerConnection.close();
+          //     peerConnection = null;
+          //   }
         }
       }
 
