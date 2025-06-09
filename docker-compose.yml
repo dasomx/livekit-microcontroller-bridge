@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  livekit-bridge:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # These should be set in a .env file or passed as environment variables
+      - LIVEKIT_HOST=${LIVEKIT_HOST}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - ROOM_NAME=${ROOM_NAME:-embedded}
+      - IDENTITY=${IDENTITY:-microcontroller-bridge}
+    command:
+      [
+        "-host=${LIVEKIT_HOST}",
+        "-api-key=${LIVEKIT_API_KEY}",
+        "-api-secret=${LIVEKIT_API_SECRET}",
+        "-room-name=${ROOM_NAME:-embedded}",
+        "-identity=${IDENTITY:-microcontroller-bridge}",
+      ]
+    restart: unless-stopped
+    networks:
+      - livekit-network
+
+networks:
+  livekit-network:
+    driver: bridge

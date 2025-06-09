@@ -26,13 +26,15 @@ var (
 )
 
 type App struct {
-	room       *lksdk.Room
-	server     *http.Server
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	peerConns  map[string]*webrtc.PeerConnection
-	peerConnMu sync.RWMutex
+	room         *lksdk.Room
+	server       *http.Server
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	peerConns    map[string]*webrtc.PeerConnection
+	peerConnMu   sync.RWMutex
+	livekitReady bool
+	livekitMu    sync.RWMutex
 }
 
 func init() {
@@ -55,18 +57,14 @@ func main() {
 	}
 
 	app := &App{
-		peerConns: make(map[string]*webrtc.PeerConnection),
+		peerConns:    make(map[string]*webrtc.PeerConnection),
+		livekitReady: false,
 	}
 	app.ctx, app.cancel = context.WithCancel(context.Background())
 
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	if err := app.initialize(); err != nil {
-		log.Errorw("failed to initialize application", err)
-		os.Exit(1)
-	}
 
 	// Start HTTP server in a goroutine
 	app.wg.Add(1)
@@ -77,7 +75,7 @@ func main() {
 		}
 	}()
 
-	log.Infow("Application started successfully", "port", "8080")
+	log.Infow("Application started successfully", "port", "8080", "note", "LiveKit will connect when first microcontroller connects")
 
 	// Wait for shutdown signal
 	<-sigChan
@@ -105,7 +103,17 @@ func validateFlags() error {
 	return nil
 }
 
-func (app *App) initialize() error {
+func (app *App) initializeLiveKit() error {
+	app.livekitMu.Lock()
+	defer app.livekitMu.Unlock()
+	
+	// Check if already initialized
+	if app.livekitReady {
+		return nil
+	}
+	
+	log.Infow("Initializing LiveKit connection...")
+	
 	var err error
 	
 	// Create LiveKit track
@@ -152,6 +160,8 @@ func (app *App) initialize() error {
 		return fmt.Errorf("failed to publish track: %w", err)
 	}
 
+	app.livekitReady = true
+	log.Infow("LiveKit connection established successfully")
 	return nil
 }
 
@@ -202,8 +212,26 @@ func (app *App) startServer() error {
 }
 
 func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
+	// Add CORS headers
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	
+	// Handle preflight OPTIONS request
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Initialize LiveKit connection if not already done
+	if err := app.initializeLiveKit(); err != nil {
+		log.Errorw("Failed to initialize LiveKit", err)
+		http.Error(w, "Failed to initialize LiveKit connection", http.StatusInternalServerError)
 		return
 	}
 

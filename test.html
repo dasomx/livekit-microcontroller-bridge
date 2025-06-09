@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LiveKit Microcontroller Bridge Test</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+        background-color: #f5f5f5;
+      }
+      .container {
+        background: white;
+        padding: 30px;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+      h1 {
+        color: #333;
+        text-align: center;
+        margin-bottom: 30px;
+      }
+      .section {
+        margin-bottom: 25px;
+        padding: 20px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        background-color: #fafafa;
+      }
+      .section h3 {
+        margin-top: 0;
+        color: #555;
+      }
+      button {
+        background-color: #007bff;
+        color: white;
+        border: none;
+        padding: 12px 24px;
+        border-radius: 5px;
+        cursor: pointer;
+        font-size: 16px;
+        margin: 5px;
+      }
+      button:hover {
+        background-color: #0056b3;
+      }
+      button:disabled {
+        background-color: #6c757d;
+        cursor: not-allowed;
+      }
+      .status {
+        padding: 10px;
+        border-radius: 5px;
+        margin: 10px 0;
+        font-weight: bold;
+      }
+      .status.success {
+        background-color: #d4edda;
+        color: #155724;
+        border: 1px solid #c3e6cb;
+      }
+      .status.error {
+        background-color: #f8d7da;
+        color: #721c24;
+        border: 1px solid #f5c6cb;
+      }
+      .status.info {
+        background-color: #d1ecf1;
+        color: #0c5460;
+        border: 1px solid #bee5eb;
+      }
+      .log {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 5px;
+        padding: 15px;
+        height: 200px;
+        overflow-y: auto;
+        font-family: monospace;
+        font-size: 12px;
+        white-space: pre-wrap;
+      }
+      input[type="text"] {
+        width: 100%;
+        padding: 8px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font-size: 14px;
+        margin: 5px 0;
+      }
+      .controls {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .audio-controls {
+        margin-top: 15px;
+      }
+      audio {
+        width: 100%;
+        margin: 10px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>🎵 LiveKit Microcontroller Bridge Test</h1>
+
+      <div class="section">
+        <h3>Connection Settings</h3>
+        <label for="bridgeUrl">Bridge URL:</label>
+        <input
+          type="text"
+          id="bridgeUrl"
+          value="http://localhost:8080/connect"
+          placeholder="http://localhost:8080/connect"
+        />
+      </div>
+
+      <div class="section">
+        <h3>WebRTC Connection</h3>
+        <div class="controls">
+          <button id="connectBtn" onclick="connectToBridge()">
+            Connect to Bridge
+          </button>
+          <button id="disconnectBtn" onclick="disconnect()" disabled>
+            Disconnect
+          </button>
+          <button id="startAudioBtn" onclick="startAudio()" disabled>
+            Start Audio
+          </button>
+          <button id="stopAudioBtn" onclick="stopAudio()" disabled>
+            Stop Audio
+          </button>
+        </div>
+        <div id="connectionStatus" class="status info">Ready to connect</div>
+      </div>
+
+      <div class="section">
+        <h3>Audio</h3>
+        <div class="audio-controls">
+          <audio id="remoteAudio" controls autoplay></audio>
+          <p>
+            <strong>Local Audio:</strong>
+            <span id="audioStatus">Not started</span>
+          </p>
+          <p>
+            <strong>Remote Audio:</strong> Will play above when received from
+            LiveKit
+          </p>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Connection Log</h3>
+        <div id="log" class="log">Ready to start testing...\n</div>
+        <button onclick="clearLog()">Clear Log</button>
+      </div>
+    </div>
+
+    <script>
+      let peerConnection = null;
+      let localStream = null;
+      let isConnected = false;
+
+      function log(message) {
+        const logElement = document.getElementById("log");
+        const timestamp = new Date().toLocaleTimeString();
+        logElement.textContent += `[${timestamp}] ${message}\n`;
+        logElement.scrollTop = logElement.scrollHeight;
+      }
+
+      function updateStatus(message, type = "info") {
+        const statusElement = document.getElementById("connectionStatus");
+        statusElement.textContent = message;
+        statusElement.className = `status ${type}`;
+      }
+
+      function updateButtons() {
+        document.getElementById("connectBtn").disabled = isConnected;
+        document.getElementById("disconnectBtn").disabled = !isConnected;
+        document.getElementById("startAudioBtn").disabled =
+          !isConnected || localStream !== null;
+        document.getElementById("stopAudioBtn").disabled =
+          !isConnected || localStream === null;
+      }
+
+      async function connectToBridge() {
+        try {
+          log("Starting connection to bridge...");
+          updateStatus("Connecting...", "info");
+
+          // Create peer connection
+          peerConnection = new RTCPeerConnection({
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+          });
+
+          // Set up event handlers
+          peerConnection.oniceconnectionstatechange = () => {
+            log(`ICE connection state: ${peerConnection.iceConnectionState}`);
+            if (peerConnection.iceConnectionState === "connected") {
+              updateStatus("Connected to bridge", "success");
+              isConnected = true;
+              updateButtons();
+            } else if (
+              peerConnection.iceConnectionState === "failed" ||
+              peerConnection.iceConnectionState === "disconnected"
+            ) {
+              updateStatus("Connection failed/disconnected", "error");
+              isConnected = false;
+              updateButtons();
+            }
+          };
+
+          peerConnection.ontrack = (event) => {
+            log("Received remote track from LiveKit");
+            const remoteAudio = document.getElementById("remoteAudio");
+            remoteAudio.srcObject = event.streams[0];
+          };
+
+          peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+              log(`ICE candidate: ${event.candidate.candidate}`);
+            } else {
+              log("ICE gathering complete");
+            }
+          };
+
+          // Add a dummy audio track (we'll replace this with real audio later)
+          const audioContext = new AudioContext();
+          const oscillator = audioContext.createOscillator();
+          const destination = audioContext.createMediaStreamDestination();
+          oscillator.connect(destination);
+          oscillator.frequency.setValueAtTime(440, audioContext.currentTime); // A4 note
+          oscillator.start();
+
+          const dummyStream = destination.stream;
+          dummyStream.getTracks().forEach((track) => {
+            peerConnection.addTrack(track, dummyStream);
+          });
+
+          log("Added dummy audio track to peer connection");
+
+          // Create offer
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          log("Created and set local offer");
+
+          // Send offer to bridge
+          const bridgeUrl = document.getElementById("bridgeUrl").value;
+          const response = await fetch(bridgeUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/sdp",
+            },
+            body: offer.sdp,
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          }
+
+          const answerSdp = await response.text();
+          log("Received answer from bridge");
+
+          // Set remote description
+          await peerConnection.setRemoteDescription({
+            type: "answer",
+            sdp: answerSdp,
+          });
+
+          log("Set remote description - connection process complete");
+          updateStatus("Connecting to LiveKit...", "info");
+        } catch (error) {
+          log(`Connection error: ${error.message}`);
+          updateStatus(`Connection failed: ${error.message}`, "error");
+          if (peerConnection) {
+            peerConnection.close();
+            peerConnection = null;
+          }
+        }
+      }
+
+      async function startAudio() {
+        try {
+          log("Requesting microphone access...");
+          localStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+
+          // Replace dummy track with real audio
+          const audioTrack = localStream.getAudioTracks()[0];
+          const sender = peerConnection
+            .getSenders()
+            .find((s) => s.track && s.track.kind === "audio");
+
+          if (sender) {
+            await sender.replaceTrack(audioTrack);
+            log("Replaced dummy audio with microphone audio");
+            document.getElementById("audioStatus").textContent =
+              "Microphone active";
+            updateButtons();
+          } else {
+            log("No audio sender found to replace");
+          }
+        } catch (error) {
+          log(`Audio error: ${error.message}`);
+          updateStatus(`Audio failed: ${error.message}`, "error");
+        }
+      }
+
+      function stopAudio() {
+        if (localStream) {
+          localStream.getTracks().forEach((track) => track.stop());
+          localStream = null;
+          document.getElementById("audioStatus").textContent = "Not started";
+          log("Stopped local audio");
+          updateButtons();
+        }
+      }
+
+      function disconnect() {
+        if (peerConnection) {
+          peerConnection.close();
+          peerConnection = null;
+        }
+
+        stopAudio();
+
+        isConnected = false;
+        updateStatus("Disconnected", "info");
+        log("Disconnected from bridge");
+        updateButtons();
+      }
+
+      function clearLog() {
+        document.getElementById("log").textContent = "Log cleared...\n";
+      }
+
+      // Initialize button states
+      updateButtons();
+
+      log("Test page loaded. Ready to connect to the bridge.");
+      log("Make sure your bridge is running with: go run .");
+    </script>
+  </body>
+</html>
