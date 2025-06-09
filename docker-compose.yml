@@ -1,11 +1,29 @@
 services:
   livekit-bridge:
     build: .
-    network_mode: "host"
+    network_mode: host
     environment:
-      # These should be set in a .env file or passed as environment variables
       LIVEKIT_HOST: ${LIVEKIT_HOST}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
       IDENTITY: ${IDENTITY:-microcontroller-bridge}
     restart: unless-stopped
+    labels:
+      # ===================================================================
+      # START OF TRAEFIK CORS LABELS
+      # ===================================================================
+
+      # 1. Define a middleware for CORS. We'll name it "cors-headers"
+      - "traefik.http.middlewares.cors-headers.headers.accessControlAllowMethods=GET,POST,OPTIONS"
+      - "traefik.http.middlewares.cors-headers.headers.accessControlAllowOriginList=*"
+      - "traefik.http.middlewares.cors-headers.headers.accessControlAllowHeaders=Content-Type"
+      - "traefik.http.middlewares.cors-headers.headers.accessControlMaxAge=86400"
+
+      # 2. Apply this middleware to the router that Coolify creates.
+      #    We use a special variable `{{.Name}}` that Traefik understands.
+      #    This is more robust than hardcoding the long name.
+      - "traefik.http.routers.{{.Name}}.middlewares=gzip,cors-headers"
+
+      # ===================================================================
+      # END OF TRAEFIK CORS LABELS
+      # ===================================================================

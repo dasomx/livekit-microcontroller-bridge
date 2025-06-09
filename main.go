@@ -267,8 +267,18 @@ func (app *App) onTrackSubscribed(track *webrtc.TrackRemote, publication *lksdk.
 
 func (app *App) startServer() error {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/test.html", http.StatusFound)
+	})
+	mux.HandleFunc("/test.html", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "test.html")
+	})
 	mux.HandleFunc("/connect", app.connectHandler)
-	
+
 	app.server = &http.Server{
 		Addr:    ":8081",
 		Handler: mux,
@@ -432,8 +442,8 @@ func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
+	w.Header().Set("Content-Type", "application/sdp")
+	w.WriteHeader(http.StatusOK)
 	
 	if _, err := fmt.Fprint(w, pc.LocalDescription().SDP); err != nil {
 		log.Errorw("Failed to write response", err)
