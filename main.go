@@ -97,7 +97,7 @@ func main() {
 	}()
 
 	log.Infow("Application started successfully", 
-		"port", "3000", 
+		"port", "8081", 
 		"livekit_host", host,
 		"note", "LiveKit will connect when first microcontroller connects",
 		"improvements", "TURN server enabled, Trickle ICE support, Extended timeouts")
@@ -328,12 +328,12 @@ func (app *App) startServer() error {
 	mux.HandleFunc("/ice", app.connectHandler)  // Same handler for ICE candidates
 
 	app.server = &http.Server{
-		Addr:    ":3000",
+		Addr:    ":8081",
 		Handler: mux,
 	}
 	
-	log.Infow("HTTP server configured", "addr", ":3000")
-	log.Infow("Starting HTTP server on :3000")
+	log.Infow("HTTP server configured", "addr", ":8081")
+	log.Infow("Starting HTTP server on :8081")
 	return app.server.ListenAndServe()
 }
 
