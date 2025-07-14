@@ -1,7 +1,8 @@
 services:
   livekit-bridge:
     build: .
-    network_mode: host
+    ports:
+      - "3000:3000"
     environment:
       LIVEKIT_HOST: ${LIVEKIT_HOST}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
