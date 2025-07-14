@@ -11,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"encoding/json"
+	"strings"
 
 	"github.com/joho/godotenv"
 	"github.com/livekit/protocol/auth"
@@ -26,6 +28,14 @@ var (
 	embeddedTrack                               *lksdk.LocalTrack
 	log                                         logger.Logger
 )
+
+// ICE candidate structure for JSON parsing
+type ICECandidate struct {
+	Type      string `json:"type"`
+	Candidate string `json:"candidate"`
+	SdpMid    string `json:"sdpMid"`
+	SdpMLineIndex int `json:"sdpMLineIndex"`
+}
 
 type App struct {
 	room         *lksdk.Room
@@ -86,7 +96,11 @@ func main() {
 		}
 	}()
 
-	log.Infow("Application started successfully", "port", "8081", "note", "LiveKit will connect when first microcontroller connects")
+	log.Infow("Application started successfully", 
+		"port", "3000", 
+		"livekit_host", host,
+		"note", "LiveKit will connect when first microcontroller connects",
+		"improvements", "TURN server enabled, Trickle ICE support, Extended timeouts")
 
 	// Wait for shutdown signal
 	<-sigChan
@@ -139,11 +153,14 @@ func validateFlags() error {
 }
 
 func (app *App) initializeLiveKitForRoom(roomName string) error {
+	log.Infow("=== LIVEKIT INITIALIZATION START ===", "roomName", roomName)
+	
 	app.livekitMu.Lock()
 	defer app.livekitMu.Unlock()
 	
 	// Initialize clients if not already done
 	if app.roomClient == nil {
+		log.Infow("Initializing LiveKit clients", "host", host)
 		app.roomClient = lksdk.NewRoomServiceClient(host, apiKey, apiSecret)
 		app.dispatchClient = lksdk.NewAgentDispatchServiceClient(host, apiKey, apiSecret)
 		log.Infow("Room service and agent dispatch clients initialized")
@@ -156,6 +173,7 @@ func (app *App) initializeLiveKitForRoom(roomName string) error {
 		app.roomConnections[roomName]++
 		app.roomConnMu.Unlock()
 		log.Infow("Reusing existing LiveKit connection", "roomName", roomName, "connections", app.roomConnections[roomName])
+		log.Infow("=== LIVEKIT INITIALIZATION COMPLETED (REUSED) ===", "roomName", roomName)
 		return nil
 	}
 	
@@ -164,57 +182,78 @@ func (app *App) initializeLiveKitForRoom(roomName string) error {
 		log.Infow("Switching rooms, disconnecting from current room", "currentRoom", app.currentRoom, "newRoom", roomName)
 		if app.room != nil {
 			app.room.Disconnect()
+			log.Infow("Disconnected from previous room", "previousRoom", app.currentRoom)
 		}
 		app.livekitReady = false
 	}
 	
-	log.Infow("Initializing LiveKit connection...", "roomName", roomName)
+	log.Infow("Creating new LiveKit connection", "roomName", roomName)
 	
 	var err error
 	
 	// Create LiveKit track
+	log.Infow("Creating LiveKit RTP track", "roomName", roomName)
 	livekitTrack, err = webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
 		"audio", "pion",
 	)
 	if err != nil {
+		log.Errorw("Failed to create LiveKit track", err, "roomName", roomName)
 		return fmt.Errorf("failed to create LiveKit track: %w", err)
 	}
+	log.Infow("LiveKit RTP track created successfully", "roomName", roomName)
 
 	// Generate access token with dynamic room name
+	log.Infow("Generating access token", "roomName", roomName, "identity", identity)
 	token, err := newAccessToken(apiKey, apiSecret, roomName, identity)
 	if err != nil {
+		log.Errorw("Failed to create access token", err, "roomName", roomName)
 		return fmt.Errorf("failed to create access token: %w", err)
 	}
+	log.Infow("Access token generated successfully", "roomName", roomName)
 
 	// Create room with callbacks
+	log.Infow("Creating LiveKit room with callbacks", "roomName", roomName)
 	app.room = lksdk.NewRoom(&lksdk.RoomCallback{
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnTrackSubscribed: app.onTrackSubscribed,
 		},
 	})
+	log.Infow("LiveKit room created successfully", "roomName", roomName)
 
 	// Prepare and join room
+	log.Infow("Preparing room connection", "roomName", roomName, "host", host)
 	if err := app.room.PrepareConnection(host, token); err != nil {
+		log.Errorw("Failed to prepare room connection", err, "roomName", roomName)
 		return fmt.Errorf("failed to prepare room connection: %w", err)
 	}
+	log.Infow("Room connection prepared successfully", "roomName", roomName)
 
+	log.Infow("Joining room with token", "roomName", roomName)
 	if err := app.room.JoinWithToken(host, token); err != nil {
+		log.Errorw("Failed to join room", err, "roomName", roomName)
 		return fmt.Errorf("failed to join room: %w", err)
 	}
+	log.Infow("Successfully joined room", "roomName", roomName)
 
 	// Create embedded track
+	log.Infow("Creating embedded track", "roomName", roomName)
 	embeddedTrack, err = lksdk.NewLocalTrack(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus})
 	if err != nil {
+		log.Errorw("Failed to create embedded track", err, "roomName", roomName)
 		return fmt.Errorf("failed to create embedded track: %w", err)
 	}
+	log.Infow("Embedded track created successfully", "roomName", roomName)
 
 	// Publish track
+	log.Infow("Publishing embedded track to room", "roomName", roomName)
 	if _, err = app.room.LocalParticipant.PublishTrack(embeddedTrack, &lksdk.TrackPublicationOptions{
 		Name: "embedded",
 	}); err != nil {
+		log.Errorw("Failed to publish track", err, "roomName", roomName)
 		return fmt.Errorf("failed to publish track: %w", err)
 	}
+	log.Infow("Embedded track published successfully", "roomName", roomName)
 
 	app.livekitReady = true
 	app.currentRoom = roomName
@@ -227,8 +266,10 @@ func (app *App) initializeLiveKitForRoom(roomName string) error {
 	log.Infow("LiveKit connection established successfully", "roomName", roomName, "connections", 1)
 	
 	// Dispatch the okchat-voice-agent to the room
+	log.Infow("Dispatching agent to room", "roomName", roomName)
 	go app.dispatchAgent(roomName)
 	
+	log.Infow("=== LIVEKIT INITIALIZATION COMPLETED SUCCESSFULLY ===", "roomName", roomName)
 	return nil
 }
 
@@ -266,29 +307,45 @@ func (app *App) onTrackSubscribed(track *webrtc.TrackRemote, publication *lksdk.
 }
 
 func (app *App) startServer() error {
+	log.Infow("=== HTTP SERVER STARTUP ===")
+	
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		log.Infow("Root path accessed", "path", r.URL.Path, "remoteAddr", r.RemoteAddr)
 		if r.URL.Path != "/" {
+			log.Infow("Path not found", "path", r.URL.Path, "remoteAddr", r.RemoteAddr)
 			http.NotFound(w, r)
 			return
 		}
+		log.Infow("Redirecting to test.html", "remoteAddr", r.RemoteAddr)
 		http.Redirect(w, r, "/test.html", http.StatusFound)
 	})
 	mux.HandleFunc("/test.html", func(w http.ResponseWriter, r *http.Request) {
+		log.Infow("Serving test.html", "remoteAddr", r.RemoteAddr)
 		http.ServeFile(w, r, "test.html")
 	})
 	mux.HandleFunc("/connect", app.connectHandler)
+	mux.HandleFunc("/ice", app.connectHandler)  // Same handler for ICE candidates
 
 	app.server = &http.Server{
-		Addr:    ":8081",
+		Addr:    ":3000",
 		Handler: mux,
 	}
 	
-	log.Infow("Server listening on :8081")
+	log.Infow("HTTP server configured", "addr", ":3000")
+	log.Infow("Starting HTTP server on :3000")
 	return app.server.ListenAndServe()
 }
 
 func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
+	// Log incoming connection attempt
+	log.Infow("=== CONNECTION ATTEMPT START ===", 
+		"method", r.Method, 
+		"path", r.URL.Path, 
+		"remoteAddr", r.RemoteAddr,
+		"userAgent", r.UserAgent(),
+		"contentType", r.Header.Get("Content-Type"))
+	
 	// Add CORS headers
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -296,17 +353,23 @@ func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
 	
 	// Handle preflight OPTIONS request
 	if r.Method == http.MethodOptions {
+		log.Infow("Handling OPTIONS preflight request")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	
 	if r.Method != http.MethodPost {
+		log.Errorw("Invalid method for connection",
+			fmt.Errorf("invalid method"),     // error 값 전달
+			"method", r.Method, "expected", "POST")
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	// Get chatbotId from query parameters
 	chatbotId := r.URL.Query().Get("chatbotId")
+	log.Infow("Query parameters received", "chatbotId", chatbotId, "allParams", r.URL.Query())
+	
 	if chatbotId == "" {
 		log.Errorw("Missing chatbotId query parameter", fmt.Errorf("chatbotId parameter is required"))
 		http.Error(w, "Missing required query parameter: chatbotId", http.StatusBadRequest)
@@ -317,41 +380,140 @@ func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
 	dynamicRoomName := fmt.Sprintf("esp-%s", chatbotId)
 	log.Infow("Processing connection request", "chatbotId", chatbotId, "roomName", dynamicRoomName)
 
-	// Initialize LiveKit connection if not already done
-	if err := app.initializeLiveKitForRoom(dynamicRoomName); err != nil {
-		log.Errorw("Failed to initialize LiveKit", err, "roomName", dynamicRoomName)
-		http.Error(w, "Failed to initialize LiveKit connection", http.StatusInternalServerError)
-		return
-	}
+	// Check content type to handle both SDP and ICE candidates
+	contentType := r.Header.Get("Content-Type")
+	log.Infow("Processing request", "contentType", contentType, "chatbotId", chatbotId)
 
-	offer, err := io.ReadAll(r.Body)
+	// Read request body
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Errorw("Failed to read request body", err)
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
+	log.Infow("Request body read successfully", "bodySize", len(bodyBytes), "chatbotId", chatbotId)
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
-			},
-		},
-	})
-	if err != nil {
-		log.Errorw("Failed to create peer connection", err)
-		http.Error(w, "Failed to create peer connection", http.StatusInternalServerError)
+	// Handle ICE candidate requests (JSON)
+	if strings.Contains(contentType, "application/json") {
+		log.Infow("Processing ICE candidate request", "chatbotId", chatbotId)
+		app.handleICECandidate(w, r, chatbotId, bodyBytes)
 		return
 	}
 
-	// Store peer connection for cleanup
-	connID := fmt.Sprintf("%p", pc)
+	// Handle SDP offer requests (application/sdp)
+	if !strings.Contains(contentType, "application/sdp") {
+		log.Errorw("Invalid content type", fmt.Errorf("expected application/sdp or application/json"), "contentType", contentType)
+		http.Error(w, "Invalid content type", http.StatusBadRequest)
+		return
+	}
+
+	// Initialize LiveKit connection if not already done
+	log.Infow("Attempting to initialize LiveKit connection", "roomName", dynamicRoomName)
+	if err := app.initializeLiveKitForRoom(dynamicRoomName); err != nil {
+		log.Errorw("Failed to initialize LiveKit", err, "roomName", dynamicRoomName)
+		http.Error(w, "Failed to initialize LiveKit connection", http.StatusInternalServerError)
+		return
+	}
+	log.Infow("LiveKit connection initialized successfully", "roomName", dynamicRoomName)
+
+	// Process SDP offer
+	app.handleSDPOffer(w, r, chatbotId, dynamicRoomName, bodyBytes)
+}
+
+func (app *App) handleICECandidate(w http.ResponseWriter, r *http.Request, chatbotId string, bodyBytes []byte) {
+	log.Infow("=== ICE CANDIDATE HANDLING START ===", "chatbotId", chatbotId)
+	
+	// Find the peer connection for this chatbot
+	var targetPC *webrtc.PeerConnection
+	app.peerConnMu.RLock()
+	for connID, pc := range app.peerConns {
+		if strings.Contains(connID, chatbotId) {
+			targetPC = pc
+			log.Infow("Found matching peer connection", "connID", connID, "chatbotId", chatbotId)
+			break
+		}
+	}
+	app.peerConnMu.RUnlock()
+
+	if targetPC == nil {
+		log.Errorw("No peer connection found for chatbot", fmt.Errorf("peer connection not found"), "chatbotId", chatbotId)
+		http.Error(w, "No peer connection found", http.StatusNotFound)
+		return
+	}
+
+	// Parse ICE candidate from JSON
+	var candidate ICECandidate
+	if err := json.Unmarshal(bodyBytes, &candidate); err != nil {
+		log.Errorw("Failed to parse ICE candidate JSON", err, "chatbotId", chatbotId)
+		http.Error(w, "Invalid ICE candidate JSON", http.StatusBadRequest)
+		return
+	}
+
+	log.Infow("Parsed ICE candidate", "candidate", candidate.Candidate, "chatbotId", chatbotId)
+
+	// Add ICE candidate to peer connection
+	sdpMLineIndex := uint16(candidate.SdpMLineIndex)
+	if err := targetPC.AddICECandidate(webrtc.ICECandidateInit{
+		Candidate: candidate.Candidate,
+		SDPMid:    &candidate.SdpMid,
+		SDPMLineIndex: &sdpMLineIndex,
+	}); err != nil {
+		log.Errorw("Failed to add ICE candidate", err, "chatbotId", chatbotId)
+		http.Error(w, "Failed to add ICE candidate", http.StatusInternalServerError)
+		return
+	}
+
+	log.Infow("ICE candidate added successfully", "chatbotId", chatbotId)
+	
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ICE candidate added"))
+	
+	log.Infow("=== ICE CANDIDATE HANDLING COMPLETED ===", "chatbotId", chatbotId)
+}
+
+func (app *App) handleSDPOffer(w http.ResponseWriter, r *http.Request, chatbotId, dynamicRoomName string, offer []byte) {
+	log.Infow("=== SDP OFFER HANDLING START ===", "chatbotId", chatbotId)
+
+	log.Infow("Creating WebRTC peer connection", "chatbotId", chatbotId)
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{
+					"stun:stun.l.google.com:19302",
+					"stun:stun1.l.google.com:19302",
+					"stun:stun2.l.google.com:19302",
+				},
+			},
+			// Add TURN server for NAT traversal
+			{
+				URLs: []string{
+					"turn:relay1.expressturn.com:3478",
+				},
+				Username:   "ef3CQZKPX1CGQP3K9P",
+				Credential: "Bvce9qkPVJgNJnmR",
+			},
+		},
+		ICETransportPolicy: webrtc.ICETransportPolicyAll,
+		ICECandidatePoolSize: 10,
+	})
+	if err != nil {
+		log.Errorw("Failed to create peer connection", err, "chatbotId", chatbotId)
+		http.Error(w, "Failed to create peer connection", http.StatusInternalServerError)
+		return
+	}
+	log.Infow("WebRTC peer connection created successfully", "chatbotId", chatbotId)
+
+	// Store peer connection for cleanup with chatbot ID for easier lookup
+	connID := fmt.Sprintf("%s-%p", chatbotId, pc)
 	app.peerConnMu.Lock()
 	app.peerConns[connID] = pc
 	app.peerConnMu.Unlock()
+	log.Infow("Peer connection stored for cleanup", "connID", connID, "chatbotId", chatbotId)
 
 	// Setup track handler
+	log.Infow("Setting up track handler for peer connection", "chatbotId", chatbotId)
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		log.Infow("Track received from peer connection", "trackKind", track.Kind(), "chatbotId", chatbotId)
 		if track.Kind() == webrtc.RTPCodecTypeAudio {
 			log.Infow("Audio track received from peer connection", "chatbotId", chatbotId)
 			
@@ -387,71 +549,175 @@ func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Add track to peer connection
+	log.Infow("Adding LiveKit track to peer connection", "chatbotId", chatbotId)
 	if _, err = pc.AddTrack(livekitTrack); err != nil {
-		log.Errorw("Failed to add track to peer connection", err)
+		log.Errorw("Failed to add track to peer connection", err, "chatbotId", chatbotId)
 		http.Error(w, "Failed to add track", http.StatusInternalServerError)
 		app.cleanupPeerConnection(connID)
 		return
 	}
+	log.Infow("LiveKit track added to peer connection successfully", "chatbotId", chatbotId)
 
 	// Log local ICE candidates as they are gathered (useful for debugging)
+	log.Infow("Setting up ICE candidate handler", "chatbotId", chatbotId)
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c != nil {
-			log.Infow("Local ICE candidate gathered", "candidate", c.ToJSON().Candidate, "chatbotId", chatbotId)
+			candidateJSON := c.ToJSON()
+			log.Infow("Local ICE candidate gathered", 
+				"candidate", candidateJSON.Candidate, 
+				"chatbotId", chatbotId)
 		} else {
 			log.Infow("ICE gathering complete (server)", "chatbotId", chatbotId)
 		}
 	})
 
+	// ---------------------------------------------------------------------------------
+	// Register handler to accept ESP32-created DataChannel
+	// Server does NOT create a DataChannel; it only listens.
+	// ---------------------------------------------------------------------------------
+	log.Infow("Setting up DataChannel handler", "chatbotId", chatbotId)
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		log.Infow("ESP32 DataChannel opened", "label", dc.Label(), "id", dc.ID(), "chatbotId", chatbotId)
+		dc.OnOpen(func() {
+			log.Infow("DataChannel ready", "label", dc.Label(), "chatbotId", chatbotId)
+			// Send handshake message to start AI conversation
+			if err := dc.SendText(`{"type":"request.create"}`); err != nil {
+				log.Errorw("Failed to send handshake message", err, "chatbotId", chatbotId)
+			} else {
+				log.Infow("Handshake request.create sent", "chatbotId", chatbotId)
+			}
+			// Send session configuration and initial response after delays
+			go func() {
+				time.Sleep(400 * time.Millisecond)
+				sessionCfg := `{"type":"session.update","session":{"modalities":["text","audio"],"instructions":"You are a helpful assistant. Please greet the user and ask how you can help.","voice":"alloy","input_audio_format":"pcm16","output_audio_format":"pcm16"}}`
+				if err := dc.SendText(sessionCfg); err != nil {
+					log.Errorw("Failed to send session.update", err, "chatbotId", chatbotId)
+				} else {
+					log.Infow("session.update sent", "chatbotId", chatbotId)
+				}
+				time.Sleep(400 * time.Millisecond)
+				respCreate := `{"type":"response.create","response":{"modalities":["text","audio"],"instructions":"Hello! How can I help you today?"}}`
+				if err := dc.SendText(respCreate); err != nil {
+					log.Errorw("Failed to send response.create", err, "chatbotId", chatbotId)
+				} else {
+					log.Infow("response.create sent", "chatbotId", chatbotId)
+				}
+			}()
+		})
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			if msg.IsString {
+				log.Infow("DataChannel text received", "message", string(msg.Data), "chatbotId", chatbotId)
+				// No echo; AI will handle the response
+			} else {
+				log.Infow("DataChannel binary received", "size", len(msg.Data), "chatbotId", chatbotId)
+			}
+		})
+		dc.OnClose(func() {
+			log.Infow("DataChannel closed", "label", dc.Label(), "chatbotId", chatbotId)
+		})
+		dc.OnError(func(err error) {
+			log.Errorw("DataChannel error", err, "label", dc.Label(), "chatbotId", chatbotId)
+		})
+	})
+
 	// Setup ICE connection state change handler
+	log.Infow("Setting up ICE connection state change handler", "chatbotId", chatbotId)
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		log.Infow("ICE connection state changed", "state", state, "chatbotId", chatbotId)
-		if state == webrtc.ICEConnectionStateFailed || 
-		   state == webrtc.ICEConnectionStateDisconnected ||
-		   state == webrtc.ICEConnectionStateClosed {
+		
+		switch state {
+		case webrtc.ICEConnectionStateConnected:
+			log.Infow("ICE connection established successfully", "chatbotId", chatbotId)
+		case webrtc.ICEConnectionStateCompleted:
+			log.Infow("ICE connection completed", "chatbotId", chatbotId)
+		case webrtc.ICEConnectionStateChecking:
+			log.Infow("ICE connection checking candidates", "chatbotId", chatbotId)
+		case webrtc.ICEConnectionStateFailed:
+			log.Errorw("ICE connection failed - will retry", fmt.Errorf("ICE connection failed"), "chatbotId", chatbotId)
+			// Don't cleanup immediately, give it time to recover
+			go func() {
+				time.Sleep(10 * time.Second)
+				if pc.ICEConnectionState() == webrtc.ICEConnectionStateFailed {
+					log.Infow("ICE connection still failed after retry period, cleaning up", "chatbotId", chatbotId)
+					app.cleanupPeerConnection(connID)
+				}
+			}()
+		case webrtc.ICEConnectionStateDisconnected:
+			log.Infow("ICE connection disconnected - monitoring for recovery", "chatbotId", chatbotId)
+			// Give some time for reconnection
+			go func() {
+				time.Sleep(30 * time.Second)
+				if pc.ICEConnectionState() == webrtc.ICEConnectionStateDisconnected {
+					log.Infow("ICE connection still disconnected after grace period, cleaning up", "chatbotId", chatbotId)
+					app.cleanupPeerConnection(connID)
+				}
+			}()
+		case webrtc.ICEConnectionStateClosed:
+			log.Infow("ICE connection closed, cleaning up", "chatbotId", chatbotId)
 			app.cleanupPeerConnection(connID)
 		}
 	})
 
+	// Setup connection state change handler for additional debugging
+	log.Infow("Setting up connection state change handler", "chatbotId", chatbotId)
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Infow("Peer connection state changed", "state", state, "chatbotId", chatbotId)
+	})
+
+	// Setup signaling state change handler
+	log.Infow("Setting up signaling state change handler", "chatbotId", chatbotId)
+	pc.OnSignalingStateChange(func(state webrtc.SignalingState) {
+		log.Infow("Signaling state changed", "state", state, "chatbotId", chatbotId)
+	})
+
 	// Set remote description
+	log.Infow("Setting remote description (offer)", "chatbotId", chatbotId)
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer, 
 		SDP:  string(offer),
 	}); err != nil {
-		log.Errorw("Failed to set remote description", err)
+		log.Errorw("Failed to set remote description", err, "chatbotId", chatbotId)
 		http.Error(w, "Failed to set remote description", http.StatusBadRequest)
 		app.cleanupPeerConnection(connID)
 		return
 	}
+	log.Infow("Remote description set successfully", "chatbotId", chatbotId)
 
 	// Create answer
+	log.Infow("Creating answer SDP", "chatbotId", chatbotId)
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
-		log.Errorw("Failed to create answer", err)
+		log.Errorw("Failed to create answer", err, "chatbotId", chatbotId)
 		http.Error(w, "Failed to create answer", http.StatusInternalServerError)
 		app.cleanupPeerConnection(connID)
 		return
 	}
+	log.Infow("Answer SDP created successfully", "chatbotId", chatbotId)
 
 	// Set local description
+	log.Infow("Setting local description (answer)", "chatbotId", chatbotId)
 	if err := pc.SetLocalDescription(answer); err != nil {
-		log.Errorw("Failed to set local description", err)
+		log.Errorw("Failed to set local description", err, "chatbotId", chatbotId)
 		http.Error(w, "Failed to set local description", http.StatusInternalServerError)
 		app.cleanupPeerConnection(connID)
 		return
 	}
+	log.Infow("Local description set successfully", "chatbotId", chatbotId)
 
-	// Wait for ICE gathering to complete with timeout
+	// Wait for ICE gathering to complete with extended timeout
+	log.Infow("Waiting for ICE gathering to complete", "chatbotId", chatbotId)
 	select {
 	case <-webrtc.GatheringCompletePromise(pc):
-		// ICE gathering completed
-	case <-time.After(10 * time.Second):
-		log.Infow("ICE gathering timeout")
+		log.Infow("ICE gathering completed successfully", "chatbotId", chatbotId)
+	case <-time.After(30 * time.Second):  // Extended timeout for TURN servers
+		log.Errorw("ICE gathering timeout",
+			fmt.Errorf("ice gathering timeout"),  // error 값 전달
+			"chatbotId", chatbotId)
 		http.Error(w, "ICE gathering timeout", http.StatusInternalServerError)
 		app.cleanupPeerConnection(connID)
 		return
 	case <-app.ctx.Done():
-		log.Infow("Context cancelled during ICE gathering")
+		log.Infow("Context cancelled during ICE gathering", "chatbotId", chatbotId)
 		http.Error(w, "Server shutting down", http.StatusServiceUnavailable)
 		app.cleanupPeerConnection(connID)
 		return
@@ -460,36 +726,52 @@ func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/sdp")
 	w.WriteHeader(http.StatusOK)
 	
+	log.Infow("Sending SDP answer to client", "chatbotId", chatbotId, "sdpLength", len(pc.LocalDescription().SDP))
 	if _, err := fmt.Fprint(w, pc.LocalDescription().SDP); err != nil {
-		log.Errorw("Failed to write response", err)
+		log.Errorw("Failed to write response", err, "chatbotId", chatbotId)
 	}
 	
-	log.Infow("Successfully handled connect request", "chatbotId", chatbotId, "roomName", dynamicRoomName)
+	log.Infow("=== CONNECTION ATTEMPT COMPLETED SUCCESSFULLY ===", "chatbotId", chatbotId, "roomName", dynamicRoomName)
 }
 
 func (app *App) cleanupPeerConnection(connID string) {
+	log.Infow("=== PEER CONNECTION CLEANUP START ===", "connID", connID)
+	
 	app.peerConnMu.Lock()
 	defer app.peerConnMu.Unlock()
 	
 	if pc, exists := app.peerConns[connID]; exists {
+		log.Infow("Closing peer connection", "connID", connID)
 		if err := pc.Close(); err != nil {
-			log.Errorw("Failed to close peer connection", err)
+			log.Errorw("Failed to close peer connection", err, "connID", connID)
+		} else {
+			log.Infow("Peer connection closed successfully", "connID", connID)
 		}
 		delete(app.peerConns, connID)
-		log.Infow("Peer connection cleaned up", "connID", connID)
+		log.Infow("Peer connection removed from map", "connID", connID)
 		
 		// Handle room cleanup when connection is closed
+		log.Infow("Triggering room cleanup", "connID", connID)
 		go app.handleRoomCleanup()
+	} else {
+		log.Infow("Peer connection not found in map", "connID", connID)
 	}
+	
+	log.Infow("=== PEER CONNECTION CLEANUP COMPLETED ===", "connID", connID)
 }
 
 func (app *App) handleRoomCleanup() {
+	log.Infow("=== ROOM CLEANUP START ===")
+	
 	app.roomConnMu.Lock()
 	defer app.roomConnMu.Unlock()
 	
 	if app.currentRoom == "" {
+		log.Infow("No current room to clean up")
 		return
 	}
+	
+	log.Infow("Checking room connection count", "roomName", app.currentRoom)
 	
 	// Decrement connection count
 	if count, exists := app.roomConnections[app.currentRoom]; exists && count > 0 {
@@ -498,12 +780,30 @@ func (app *App) handleRoomCleanup() {
 		
 		log.Infow("Connection count updated", "roomName", app.currentRoom, "connections", newCount)
 		
-		// If no more connections, delete the room
+		// If no more connections, schedule room deletion with extended grace period
 		if newCount == 0 {
-			go app.deleteRoom(app.currentRoom)
-			delete(app.roomConnections, app.currentRoom)
+			log.Infow("No more connections, scheduling room deletion after extended grace period", "roomName", app.currentRoom)
+			roomToDelete := app.currentRoom
+			go func() {
+				time.Sleep(120 * time.Second) // Extended grace period for reconnection attempts
+				app.roomConnMu.Lock()
+				defer app.roomConnMu.Unlock()
+				if cnt, ok := app.roomConnections[roomToDelete]; !ok || cnt == 0 {
+					log.Infow("Grace period elapsed, deleting room", "roomName", roomToDelete)
+					app.deleteRoom(roomToDelete)
+					delete(app.roomConnections, roomToDelete)
+				} else {
+					log.Infow("New connections appeared, abort room deletion", "roomName", roomToDelete, "connections", cnt)
+				}
+			}()
+		} else {
+			log.Infow("Room still has active connections", "roomName", app.currentRoom, "connections", newCount)
 		}
+	} else {
+		log.Infow("Room connection count not found or already zero", "roomName", app.currentRoom)
 	}
+	
+	log.Infow("=== ROOM CLEANUP COMPLETED ===")
 }
 
 func (app *App) deleteRoom(roomName string) {

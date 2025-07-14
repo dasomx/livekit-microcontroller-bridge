@@ -40,8 +40,8 @@ RUN chown appuser:appgroup main
 # Switch to non-root user
 USER appuser
 
-# Expose port 8081
-EXPOSE 8081
+# Expose port 3000
+EXPOSE 3000
 
 # Command to run the application
 ENTRYPOINT ["./main"] 
