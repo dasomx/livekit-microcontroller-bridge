@@ -324,6 +324,7 @@ func (app *App) startServer() error {
 		log.Infow("Serving test.html", "remoteAddr", r.RemoteAddr)
 		http.ServeFile(w, r, "test.html")
 	})
+	mux.HandleFunc("/rtc/credentials", app.turnCredentialsHandler)  // New endpoint for TURN credentials
 	mux.HandleFunc("/connect", app.connectHandler)
 	mux.HandleFunc("/ice", app.connectHandler)  // Same handler for ICE candidates
 
@@ -335,6 +336,103 @@ func (app *App) startServer() error {
 	log.Infow("HTTP server configured", "addr", ":8081")
 	log.Infow("Starting HTTP server on :8081")
 	return app.server.ListenAndServe()
+}
+
+func (app *App) turnCredentialsHandler(w http.ResponseWriter, r *http.Request) {
+	log.Infow("=== TURN CREDENTIALS REQUEST ===", "method", r.Method, "remoteAddr", r.RemoteAddr)
+	
+	// Add CORS headers
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	
+	// Handle preflight OPTIONS request
+	if r.Method == http.MethodOptions {
+		log.Infow("Handling OPTIONS preflight request for TURN credentials")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	
+	if r.Method != http.MethodGet {
+		log.Errorw("Invalid method for TURN credentials", fmt.Errorf("invalid method"), "method", r.Method)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	// Generate TURN credentials response with Google Cloud compatible options
+	credentials := TurnCredentials{
+		IceServers: []IceServer{
+			// Option 1: Self-hosted coturn on Google Cloud (recommended)
+			// Deploy coturn server on Google Cloud Compute Engine
+			/*
+			{
+				URL:      "turn:your-gcp-vm-ip:3478",
+				Username: os.Getenv("COTURN_USERNAME"),
+				Password: os.Getenv("COTURN_PASSWORD"),
+			},
+			{
+				URL:      "turns:your-gcp-vm-ip:5349",  // TLS version
+				Username: os.Getenv("COTURN_USERNAME"),
+				Password: os.Getenv("COTURN_PASSWORD"),
+			},
+			*/
+			
+			// Option 2: Twilio TURN service (paid, enterprise-grade)
+			// Sign up at https://www.twilio.com/stun-turn
+			/*
+			{
+				URL:      "turn:global.turn.twilio.com:3478?transport=udp",
+				Username: os.Getenv("TWILIO_TURN_USERNAME"),
+				Password: os.Getenv("TWILIO_TURN_PASSWORD"),
+			},
+			{
+				URL:      "turns:global.turn.twilio.com:5349?transport=tcp",
+				Username: os.Getenv("TWILIO_TURN_USERNAME"),
+				Password: os.Getenv("TWILIO_TURN_PASSWORD"),
+			},
+			*/
+			
+			// Option 3: Cloudflare TURN service (reliable, pay-per-use)
+			/*
+			{
+				URL:      "turn:turn.cloudflare.com:3478",
+				Username: os.Getenv("CLOUDFLARE_TURN_USERNAME"),
+				Password: os.Getenv("CLOUDFLARE_TURN_PASSWORD"),
+			},
+			*/
+			
+			// Option 4: ExpressTurn (free tier - for testing only)
+			{
+				URL:      "turn:relay1.expressturn.com:3478",
+				Username: "ef3CQZKPX1CGQP3K9P",
+				Password: "Bvce9qkPVJgNJnmR",
+			},
+			
+			// Always include reliable STUN servers as fallback
+			{
+				URL: "stun:stun.l.google.com:19302",
+			},
+			{
+				URL: "stun:stun1.l.google.com:19302",
+			},
+			{
+				URL: "stun:stun.cloudflare.com:3478",
+			},
+		},
+	}
+	
+	log.Infow("Generated TURN credentials", "iceServers", len(credentials.IceServers))
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	
+	if err := json.NewEncoder(w).Encode(credentials); err != nil {
+		log.Errorw("Failed to encode TURN credentials", err)
+		http.Error(w, "Failed to encode credentials", http.StatusInternalServerError)
+		return
+	}
+	
+	log.Infow("TURN credentials sent successfully", "remoteAddr", r.RemoteAddr)
 }
 
 func (app *App) connectHandler(w http.ResponseWriter, r *http.Request) {
@@ -474,7 +572,7 @@ func (app *App) handleICECandidate(w http.ResponseWriter, r *http.Request, chatb
 func (app *App) handleSDPOffer(w http.ResponseWriter, r *http.Request, chatbotId, dynamicRoomName string, offer []byte) {
 	log.Infow("=== SDP OFFER HANDLING START ===", "chatbotId", chatbotId)
 
-	log.Infow("Creating WebRTC peer connection", "chatbotId", chatbotId)
+	log.Infow("Creating WebRTC peer connection with enhanced TURN configuration", "chatbotId", chatbotId)
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
@@ -484,7 +582,7 @@ func (app *App) handleSDPOffer(w http.ResponseWriter, r *http.Request, chatbotId
 					"stun:stun2.l.google.com:19302",
 				},
 			},
-			// Add TURN server for NAT traversal
+			// Primary TURN server for NAT traversal
 			{
 				URLs: []string{
 					"turn:relay1.expressturn.com:3478",
@@ -492,16 +590,33 @@ func (app *App) handleSDPOffer(w http.ResponseWriter, r *http.Request, chatbotId
 				Username:   "ef3CQZKPX1CGQP3K9P",
 				Credential: "Bvce9qkPVJgNJnmR",
 			},
+			// Secondary TURN server for redundancy
+			{
+				URLs: []string{
+					"turn:relay2.expressturn.com:3478",
+				},
+				Username:   "ef3CQZKPX1CGQP3K9P",
+				Credential: "Bvce9qkPVJgNJnmR",
+			},
+			// LiveKit embedded TURN server (if available)
+			{
+				URLs: []string{
+					"turn:esp-bridge.v2.okchat.ai:3478",
+				},
+				Username:   "livekit",
+				Credential: "livekit",
+			},
 		},
 		ICETransportPolicy: webrtc.ICETransportPolicyAll,
 		ICECandidatePoolSize: 10,
+		BundlePolicy: webrtc.BundlePolicyMaxBundle,  // Optimize for bundle
 	})
 	if err != nil {
 		log.Errorw("Failed to create peer connection", err, "chatbotId", chatbotId)
 		http.Error(w, "Failed to create peer connection", http.StatusInternalServerError)
 		return
 	}
-	log.Infow("WebRTC peer connection created successfully", "chatbotId", chatbotId)
+	log.Infow("WebRTC peer connection created successfully with TURN servers", "chatbotId", chatbotId)
 
 	// Store peer connection for cleanup with chatbot ID for easier lookup
 	connID := fmt.Sprintf("%s-%p", chatbotId, pc)
@@ -928,6 +1043,17 @@ func (app *App) dispatchAgent(roomName string) {
 	} else {
 		log.Infow("Agent dispatched successfully", "roomName", roomName, "agentName", "okchat-voice-agent", "dispatch", dispatch)
 	}
+}
+
+// TURN credentials structure for ESP32
+type TurnCredentials struct {
+	IceServers []IceServer `json:"ice_servers"`
+}
+
+type IceServer struct {
+	URL      string `json:"url"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 
